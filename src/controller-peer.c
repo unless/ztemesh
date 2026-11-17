@@ -130,6 +130,365 @@ static int write_assoc(const uint8_t *mac, const struct ap_client_group *groups,
     return write_peer(mac, "assoc", text, used);
 }
 
+/* -----------------------------------------------------------------------------------------------
+ * Factory children (G100S / G1612) never send this repository's client sub-TLV 0x70. They do answer
+ * every STA Metrics Query (0x800d) with a STA Metrics Response (0x800e), whose TLV 0x96 is
+ * <STA MAC[6], 0x01, BSSID[6], metrics...>; the Ethernet source is the child's AL MAC. One frame
+ * names one station, while <node>.assoc is a whole table, so observations are cached here and the
+ * file is rewritten atomically on every report. The 30-second window matches the reader's ASSOC_AGE.
+ * ----------------------------------------------------------------------------------------------- */
+
+#define ASSOC_CACHE_MAX 96
+#define ASSOC_BSS_MAX 64
+#define ASSOC_AGE 30
+
+struct assoc_observation {
+    uint8_t node[6];
+    uint8_t station[6];
+    uint8_t bssid[6];
+    time_t seen;
+};
+
+struct assoc_bss_name {
+    uint8_t node[6];
+    uint8_t bssid[6];
+    char ssid[CONTROLLER_SSID_MAX + 1];
+};
+
+static struct assoc_observation assoc_cache[ASSOC_CACHE_MAX];
+static unsigned int assoc_cache_count;
+static struct assoc_bss_name assoc_bss_names[ASSOC_BSS_MAX];
+static unsigned int assoc_bss_count;
+
+/* SSID bytes off the wire are not NUL-terminated and may carry control characters that would break
+ * the tab-separated .assoc rows. */
+static void assoc_copy_ssid(char out[CONTROLLER_SSID_MAX + 1], const uint8_t *text, size_t length)
+{
+    size_t k;
+    if (length > CONTROLLER_SSID_MAX)
+        length = CONTROLLER_SSID_MAX;
+    for (k = 0; k < length; k++) {
+        unsigned char c = text[k];
+        out[k] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+    }
+    out[k] = 0;
+}
+
+/* AP Operational BSS (0x83): radio count, then per radio {radio id[6], interface count}, then per
+ * interface {BSSID[6], SSID length, SSID}. The same walk node_metrics_decode() counts on; here the
+ * advertised names are kept so a client's BSSID can be shown with its real SSID. */
+static void assoc_learn_bss(const uint8_t *node, const uint8_t *value, size_t length)
+{
+    unsigned int radios, r;
+    size_t at = 0;
+    if (length < 1)
+        return;
+    radios = value[at++];
+    for (r = 0; r < radios; r++) {
+        unsigned int interfaces, i;
+        if (length - at < 7)
+            return;
+        at += 6; /* radio identifier */
+        interfaces = value[at++];
+        for (i = 0; i < interfaces; i++) {
+            const uint8_t *bssid;
+            size_t ssid;
+            unsigned int k;
+            struct assoc_bss_name *slot = NULL;
+            if (length - at < 7)
+                return;
+            bssid = value + at;
+            at += 6;
+            ssid = value[at++];
+            if (ssid > length - at)
+                return;
+            for (k = 0; k < assoc_bss_count; k++)
+                if (!memcmp(assoc_bss_names[k].node, node, 6) &&
+                    !memcmp(assoc_bss_names[k].bssid, bssid, 6)) {
+                    slot = &assoc_bss_names[k];
+                    break;
+                }
+            if (!slot && assoc_bss_count < ASSOC_BSS_MAX)
+                slot = &assoc_bss_names[assoc_bss_count++];
+            if (slot) {
+                memcpy(slot->node, node, 6);
+                memcpy(slot->bssid, bssid, 6);
+                assoc_copy_ssid(slot->ssid, value + at, ssid);
+            }
+            at += ssid;
+        }
+    }
+}
+
+static const char *assoc_ssid_for(const uint8_t *node, const uint8_t *bssid)
+{
+    unsigned int k;
+    for (k = 0; k < assoc_bss_count; k++)
+        if (!memcmp(assoc_bss_names[k].node, node, 6) && !memcmp(assoc_bss_names[k].bssid, bssid, 6))
+            return assoc_bss_names[k].ssid;
+    return "";
+}
+
+/* The service publishes the on-air names and the node topology in the run directory the sandbox
+ * shares with the host (peers/ lives there too). Reading them here keeps the .so self-contained:
+ * no UCI call, no shell helper, no second daemon. ZTE_MESH_RUN_DIR is the host test's handle on it. */
+static const char *assoc_run_dir(void)
+{
+    const char *dir = getenv("ZTE_MESH_RUN_DIR");
+    return dir && *dir ? dir : "/run/zte-mesh";
+}
+
+static void assoc_trim(char *text)
+{
+    size_t n = strlen(text);
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' '))
+        text[--n] = 0;
+}
+
+/* /run/zte-mesh/config is written by the init script from the validated UCI values: the two names
+ * are the ones actually on the air, including the dual-band-sync / suffix derivation. */
+static void assoc_read_profile(char s0[CONTROLLER_SSID_MAX + 1], char s1[CONTROLLER_SSID_MAX + 1])
+{
+    char path[256], line[256], suffix[16] = "-5G";
+    FILE *f;
+    int sync = 0;
+    s0[0] = s1[0] = 0;
+    if (snprintf(path, sizeof(path), "%s/config", assoc_run_dir()) >= (int)sizeof(path))
+        return;
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        char *value;
+        if (!eq)
+            continue;
+        *eq = 0;
+        value = eq + 1;
+        assoc_trim(value);
+        if (!strcmp(line, "radio0.ssid"))
+            assoc_copy_ssid(s0, (const uint8_t *)value, strlen(value));
+        else if (!strcmp(line, "radio1.ssid"))
+            assoc_copy_ssid(s1, (const uint8_t *)value, strlen(value));
+        else if (!strcmp(line, "wifi.dual_band_sync"))
+            sync = (value[0] == '1') ? 1 : 0;
+        else if (!strcmp(line, "wifi.essid_suffix")) {
+            size_t n = strlen(value);
+            if (n > sizeof(suffix) - 1)
+                n = sizeof(suffix) - 1;
+            memcpy(suffix, value, n);
+            suffix[n] = 0;
+        }
+    }
+    fclose(f);
+    if (sync) {
+        memcpy(s1, s0, strlen(s0) + 1);
+    } else if (!s1[0] && s0[0]) {
+        snprintf(s1, CONTROLLER_SSID_MAX + 1, "%s%s", s0, suffix);
+        s1[CONTROLLER_SSID_MAX] = 0;
+    }
+}
+
+/* A hand-rolled MAC reader rather than sscanf/strtol: glibc 2.38+ redirects those to
+ * __isoc23_sscanf / __isoc23_strtol, which the device's glibc 2.26 does not export. */
+static int assoc_hex(unsigned char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int assoc_parse_mac(const char *text, uint8_t out[6])
+{
+    unsigned int k;
+    if (strlen(text) < 17)
+        return 0;
+    for (k = 0; k < 6; k++) {
+        int hi = assoc_hex((unsigned char)text[3 * k]);
+        int lo = assoc_hex((unsigned char)text[3 * k + 1]);
+        if (hi < 0 || lo < 0)
+            return 0;
+        if (k < 5 && text[3 * k + 2] != ':')
+            return 0;
+        out[k] = (uint8_t)((hi << 4) | lo);
+    }
+    return 1;
+}
+
+static void assoc_set_name(const uint8_t *node, const uint8_t *bssid, const char *ssid)
+{
+    unsigned int k;
+    struct assoc_bss_name *slot = NULL;
+    size_t n;
+    for (k = 0; k < assoc_bss_count; k++)
+        if (!memcmp(assoc_bss_names[k].node, node, 6) && !memcmp(assoc_bss_names[k].bssid, bssid, 6)) {
+            slot = &assoc_bss_names[k];
+            break;
+        }
+    if (!slot && assoc_bss_count < ASSOC_BSS_MAX)
+        slot = &assoc_bss_names[assoc_bss_count++];
+    if (!slot)
+        return;
+    memcpy(slot->node, node, 6);
+    memcpy(slot->bssid, bssid, 6);
+    n = strlen(ssid);
+    if (n > CONTROLLER_SSID_MAX)
+        n = CONTROLLER_SSID_MAX;
+    memcpy(slot->ssid, ssid, n);
+    slot->ssid[n] = 0;
+}
+
+/* state.json lists each node's BSSes in radio order. The first is 2.4 GHz, the second 5 GHz, and
+ * anything after that a guest or a hidden backhaul with no name to show. A cheap ordered scan is
+ * enough: the file is the service's own, not arbitrary user input. */
+static void assoc_load_state(const char *s0, const char *s1)
+{
+    static char buf[16384];
+    char path[256];
+    FILE *f;
+    size_t n;
+    char *p;
+    if (snprintf(path, sizeof(path), "%s/state.json", assoc_run_dir()) >= (int)sizeof(path))
+        return;
+    f = fopen(path, "r");
+    if (!f)
+        return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    p = buf;
+    while ((p = strstr(p, "\"mac\":\"")) != NULL) {
+        uint8_t node[6];
+        char *next = strstr(p + 7, "\"mac\":\"");
+        char *limit = next ? next : buf + n;
+        char *r = p + 7;
+        unsigned int idx = 0;
+        int ok = assoc_parse_mac(p + 7, node);
+        while ((r = strstr(r, "\"bssid\":\"")) != NULL) {
+            uint8_t bssid[6];
+            if (r >= limit)
+                break;
+            if (ok && assoc_parse_mac(r + 9, bssid)) {
+                idx++;
+                assoc_set_name(node, bssid, idx == 1 ? s0 : (idx == 2 ? s1 : ""));
+            }
+            r += 9;
+        }
+        p = limit;
+        if (!next)
+            break;
+    }
+}
+
+static void assoc_refresh_names(time_t now)
+{
+    static time_t loaded;
+    char s0[CONTROLLER_SSID_MAX + 1], s1[CONTROLLER_SSID_MAX + 1];
+    if (loaded && now >= loaded && now - loaded < 5)
+        return;
+    assoc_read_profile(s0, s1);
+    assoc_load_state(s0, s1);
+    loaded = now;
+}
+
+static int assoc_remember(const uint8_t *node, const uint8_t *station, const uint8_t *bssid, time_t now)
+{
+    unsigned int k, oldest = 0;
+    struct assoc_observation *slot = NULL;
+    for (k = 0; k < assoc_cache_count; k++) {
+        if (!memcmp(assoc_cache[k].node, node, 6) && !memcmp(assoc_cache[k].station, station, 6)) {
+            slot = &assoc_cache[k];
+            break;
+        }
+        if (assoc_cache[k].seen < assoc_cache[oldest].seen)
+            oldest = k;
+    }
+    if (!slot) {
+        if (assoc_cache_count < ASSOC_CACHE_MAX)
+            slot = &assoc_cache[assoc_cache_count++];
+        else
+            slot = &assoc_cache[oldest];
+    }
+    memcpy(slot->node, node, 6);
+    memcpy(slot->station, station, 6);
+    memcpy(slot->bssid, bssid, 6);
+    slot->seen = now;
+    return 1;
+}
+
+static void assoc_rewrite_node(const uint8_t *node, time_t now)
+{
+    char text[4096];
+    size_t used;
+    unsigned int k;
+    int n = snprintf(text, sizeof(text), "epoch=%ld\n", (long)now);
+    if (n <= 0)
+        return;
+    used = (size_t)n;
+    for (k = 0; k < assoc_cache_count; k++) {
+        const struct assoc_observation *o = &assoc_cache[k];
+        if (memcmp(o->node, node, 6) || o->seen > now || now - o->seen > ASSOC_AGE)
+            continue;
+        n = snprintf(text + used, sizeof(text) - used,
+                     "%02x:%02x:%02x:%02x:%02x:%02x\t"
+                     "%02x:%02x:%02x:%02x:%02x:%02x\t%s\n",
+                     o->station[0], o->station[1], o->station[2], o->station[3], o->station[4], o->station[5],
+                     o->bssid[0], o->bssid[1], o->bssid[2], o->bssid[3], o->bssid[4], o->bssid[5],
+                     assoc_ssid_for(node, o->bssid));
+        if (n <= 0 || (size_t)n >= sizeof(text) - used)
+            break;
+        used += (size_t)n;
+    }
+    (void)write_peer(node, "assoc", text, used);
+}
+
+/* Re-stamp every node with an observation, not just the one whose frame arrived: the reader drops a
+ * file whose epoch is older than 30 seconds, and a quiet node must not disappear while the others
+ * keep answering. */
+static void assoc_rewrite_all(time_t now)
+{
+    unsigned int i, k;
+    for (i = 0; i < assoc_cache_count; i++) {
+        for (k = 0; k < i; k++)
+            if (!memcmp(assoc_cache[k].node, assoc_cache[i].node, 6))
+                break;
+        if (k == i)
+            assoc_rewrite_node(assoc_cache[i].node, now);
+    }
+}
+
+static void assoc_note_frame(const uint8_t *frame, size_t bytes, const struct cmdu_header *header)
+{
+    struct tlv_cursor cursor;
+    const uint8_t *value, *node = frame + 6;
+    unsigned int type;
+    size_t length;
+    time_t now = time(NULL);
+    int seen = 0;
+    if (header->type == CONTROLLER_MSG_AP_CAPABILITY_REPORT) {
+        tlv_open(&cursor, frame, bytes);
+        while (tlv_next(&cursor, &type, &value, &length))
+            if (type == CONTROLLER_TLV_AP_OPERATIONAL_BSS)
+                assoc_learn_bss(node, value, length);
+        return;
+    }
+    if (header->type != CONTROLLER_MSG_STA_METRICS_RESPONSE)
+        return;
+    tlv_open(&cursor, frame, bytes);
+    while (tlv_next(&cursor, &type, &value, &length))
+        if (type == CONTROLLER_TLV_STA_METRICS && length >= 13) {
+            /* <STA MAC[6]> <0x01> <BSSID[6]> <metrics...>. The middle byte is the one ZTE puts
+             * between the two addresses; the trailing metrics are not needed here. */
+            assoc_remember(node, value, value + 7, now);
+            seen = 1;
+        }
+    if (seen) {
+        assoc_refresh_names(now);
+        assoc_rewrite_all(now);
+    }
+}
+
 /* Is this MAC one of the PEERS_KNOWN the daemon will record? 1 = admitted (a known MAC, or a new one with room
  * left), 0 = the budget is full and this frame is from a stranger. */
 static int admit(const uint8_t *mac)
@@ -163,6 +522,10 @@ int controller_peer_note(const uint8_t *frame, size_t bytes)
     if (bytes < CONTROLLER_1905_HEADER || !cmdu_decode(frame, bytes, &header) ||
         !header.last_fragment || header.fragment)
         return 0;
+
+    /* The factory-children client attribution path runs before the early returns below: a 0x800e
+     * carries no AP metrics and would otherwise be dropped as status chatter. */
+    assoc_note_frame(frame, bytes, &header);
 
     /* The answers to a client action: a BTM report (0x8015) says whether the client accepted, and a Steering
      * Completed (0x8017) says it left. Both name the client, which is what the action table keys on, so the file is

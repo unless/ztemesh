@@ -31,6 +31,12 @@
 #define CONTROLLER_MSG_AP_METRICS_QUERY 0x800b
 #define CONTROLLER_MSG_AP_METRICS_RESPONSE 0x800c
 
+/* ZTE's STA Metrics exchange: a factory child answers the controller's 0x800d query with a 0x800e
+ * whose TLV 0x96 is <STA MAC[6], 0x01, BSSID[6], metrics...>. The Ethernet source is the child's
+ * AL MAC, so that one frame attributes a client to a node without the repository's 0x70 sub-TLV. */
+#define CONTROLLER_MSG_STA_METRICS_RESPONSE 0x800e
+#define CONTROLLER_TLV_STA_METRICS 0x96
+
 struct cmdu_header {
     unsigned int type;      /* CMDU message type, e.g. 0x0003 topology response, 0x800c AP metrics response */
     unsigned int message_id;
